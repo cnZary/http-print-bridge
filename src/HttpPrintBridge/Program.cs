@@ -15,26 +15,60 @@ public static class Program
 
     public static async Task<int> Main(string[] args)
     {
-        WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(args);
+        // A bare "--hide-console" would make .NET's command-line config provider swallow
+        // the next argument as its value (breaking --urls). Normalise it up front.
+        args = NormalizeSwitchArgs(args, "--hide-console");
+
+        // Load appsettings.json from beside the exe regardless of the launch directory.
+        WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
+        {
+            Args = args,
+            ContentRootPath = AppContext.BaseDirectory,
+        });
 
         // --- configuration (command line > environment > appsettings.json) ---
         long maxUploadBytes = ReadLong(builder.Configuration, "MaxUploadBytes", "PRINTBRIDGE_MAX_UPLOAD_BYTES", 200L * 1024 * 1024);
         int defaultDpi = (int)ReadLong(builder.Configuration, "DefaultDpi", "PRINTBRIDGE_DEFAULT_DPI", 300);
         int printTimeoutSeconds = (int)ReadLong(builder.Configuration, "PrintTimeoutSeconds", "PRINTBRIDGE_PRINT_TIMEOUT", 120);
+        bool hideConsole = ReadFlag(args, builder.Configuration, "--hide-console", "PRINTBRIDGE_HIDE_CONSOLE", "HideConsole");
         string key = ReadString(builder.Configuration, "Key", "PRINTBRIDGE_KEY") ?? string.Empty;
 
         if (string.IsNullOrWhiteSpace(key))
         {
-            key = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
-            Console.WriteLine();
-            Console.WriteLine("  ============================================================");
-            Console.WriteLine("   No auth key configured — generated a random key:");
-            Console.WriteLine($"     {key}");
-            Console.WriteLine("   Configure it via --key=... or PRINTBRIDGE_KEY to keep it");
-            Console.WriteLine("   stable across restarts.");
-            Console.WriteLine("  ============================================================");
-            Console.WriteLine();
+            // Reuse the key persisted by a previous hidden run so restarts stay usable.
+            string keyFile = Path.Combine(AppContext.BaseDirectory, "key.txt");
+            if (File.Exists(keyFile))
+            {
+                key = File.ReadAllText(keyFile).Trim();
+            }
+
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                key = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+                Console.WriteLine();
+                Console.WriteLine("  ============================================================");
+                Console.WriteLine("   No auth key configured — generated a random key:");
+                Console.WriteLine($"     {key}");
+                Console.WriteLine("   Configure it via --key=... or PRINTBRIDGE_KEY to keep it");
+                Console.WriteLine("   stable across restarts.");
+                Console.WriteLine("  ============================================================");
+                Console.WriteLine();
+
+                // With a hidden console nobody can read the banner, so persist the key.
+                if (hideConsole)
+                {
+                    File.WriteAllText(keyFile, key);
+                    Console.WriteLine($"   Key also written to: {keyFile}");
+                    Console.WriteLine();
+                }
+            }
         }
+
+        // Hide the console window once startup output has been written. With an
+        // auto-generated key the banner above is the only place the key is shown,
+        // so pair --hide-console with --key=... to keep the key reachable.
+        if (hideConsole)
+            Win32.ConsoleWindow.HideOwnConsole();
 
         var keyAuth = new KeyAuth(key);
 
@@ -170,6 +204,26 @@ public static class Program
 
     // ---------------------------------------------------------------- helpers
 
+    /// <summary>
+    /// Rewrites bare boolean switches (<c>--flag</c>) into <c>--flag=true</c> so the
+    /// configuration command-line provider does not consume the following argument.
+    /// </summary>
+    private static string[] NormalizeSwitchArgs(string[] args, params string[] switches)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            foreach (string sw in switches)
+            {
+                if (args[i].Equals(sw, StringComparison.OrdinalIgnoreCase))
+                {
+                    args[i] = sw + "=true";
+                    break;
+                }
+            }
+        }
+        return args;
+    }
+
     private static async Task<byte[]> ReadPdfAsync(HttpRequest req, long maxUploadBytes)
     {
         if (req.HasFormContentType)
@@ -240,6 +294,34 @@ public static class Program
         }
         return null;
     }
+
+    /// <summary>
+    /// Boolean flag supporting both the bare switch (<c>--hide-console</c>) and the
+    /// explicit form (<c>--hide-console=true|false</c>), plus env var and appsettings.
+    /// </summary>
+    private static bool ReadFlag(string[] args, IConfiguration cfg, string switchName,
+        string envName, string configName)
+    {
+        foreach (string arg in args)
+        {
+            if (arg.Equals(switchName, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (arg.StartsWith(switchName + "=", StringComparison.OrdinalIgnoreCase))
+                return IsTruthy(arg[(switchName.Length + 1)..]);
+        }
+
+        foreach (string? candidate in new[] { cfg[envName], cfg[$"PrintBridge:{configName}"], cfg[configName] })
+        {
+            if (!string.IsNullOrWhiteSpace(candidate))
+                return IsTruthy(candidate);
+        }
+
+        return false;
+    }
+
+    private static bool IsTruthy(string value) =>
+        value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1";
 
     private sealed class TooLargeException : Exception;
 }
