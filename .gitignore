@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+dist/
+
+# Downloaded native dependency (scripts/fetch-pdfium.ps1)
+native/pdfium/
+
+# IDE / user files
+.vs/
+*.user
+*.suo
+
+# Test artifacts
+test/*.pdf
