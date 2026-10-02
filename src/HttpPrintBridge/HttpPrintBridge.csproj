@@ -18,6 +18,20 @@
     <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
   </PropertyGroup>
 
+  <!-- Non-Debug only: trade longer AOT compile time for runtime output.
+       Speed (default) = optimize-time codegen + vectorised sort: faster code, slightly
+       larger exe. Pass -p:OptimizationPreference=Size for optimize-space codegen and
+       dehydrated runtime data: smaller exe/footprint.
+       IlcFoldIdenticalMethodBodies=true folds all identical bodies (the Release default
+       folds generics only): a size win that costs extra link time.
+       StackTraceSupport=false drops stack-trace metadata (smaller exe; exception stack
+       traces lose method names, so diagnose with the debug build instead). -->
+  <PropertyGroup Condition="'$(Configuration)' != 'Debug'">
+    <OptimizationPreference>Speed</OptimizationPreference>
+    <IlcFoldIdenticalMethodBodies>true</IlcFoldIdenticalMethodBodies>
+    <StackTraceSupport>false</StackTraceSupport>
+  </PropertyGroup>
+
   <ItemGroup>
     <!-- pdfium.dll ships beside the exe; headers stay in native/ for reference only. -->
     <None Include="..\..\native\pdfium\bin\pdfium.dll" Link="pdfium.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
