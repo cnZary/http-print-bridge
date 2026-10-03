@@ -232,17 +232,30 @@ public static class Program
             IFormFile? file = form.Files.GetFile("file") ?? form.Files.FirstOrDefault();
             if (file is null)
                 throw new InvalidOperationException("multipart/form-data contains no file part (expected field name 'file').");
-            if (file.Length > maxUploadBytes)
+            if (file.Length > maxUploadBytes || file.Length > int.MaxValue)
                 throw new TooLargeException();
 
-            await using var ms = new MemoryStream((int)Math.Min(file.Length, int.MaxValue));
-            await file.CopyToAsync(ms, req.HttpContext.RequestAborted);
-            return ms.ToArray();
+            // Read straight into the exact-size result array: no intermediate
+            // MemoryStream growth and no ToArray copy for large uploads.
+            byte[] pdf = GC.AllocateUninitializedArray<byte>((int)file.Length);
+            await using Stream src = file.OpenReadStream();
+            await src.ReadExactlyAsync(pdf, req.HttpContext.RequestAborted);
+            return pdf;
         }
 
         if (req.ContentLength is > 0 and var len && len > maxUploadBytes)
             throw new TooLargeException();
 
+        if (req.ContentLength is > 0 and var known)
+        {
+            // Content-Length present: same exact-size single-read path.
+            byte[] pdf = GC.AllocateUninitializedArray<byte>((int)known);
+            await req.Body.ReadExactlyAsync(pdf, req.HttpContext.RequestAborted);
+            return pdf;
+        }
+
+        // Chunked body of unknown length (rare): grow a buffer, then one final copy
+        // into the exact-size array that PdfDocument pins for its lifetime.
         await using var buffer = new MemoryStream();
         await req.Body.CopyToAsync(buffer, req.HttpContext.RequestAborted);
         if (buffer.Length > maxUploadBytes)

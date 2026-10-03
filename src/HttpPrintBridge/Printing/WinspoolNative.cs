@@ -58,6 +58,7 @@ internal static partial class WinspoolNative
     public const int PHYSICALOFFSETY = 113;
 
     public const int HALFTONE = 4;
+    public const int COLORONCOLOR = 3;
     public const int SRCCOPY = 0x00CC0020;
     public const int DIB_RGB_COLORS = 0;
     public const int BI_RGB = 0;
@@ -185,6 +186,10 @@ internal static partial class WinspoolNative
     [LibraryImport("winspool.drv", EntryPoint = "ClosePrinter", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool ClosePrinter(nint hPrinter);
+
+    [LibraryImport("winspool.drv", EntryPoint = "GetPrinterW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetPrinter(nint hPrinter, uint level, nint pPrinter, uint cbBuf, out uint pcbNeeded);
 
     [LibraryImport("winspool.drv", EntryPoint = "DocumentPropertiesW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
     public static partial int DocumentProperties(

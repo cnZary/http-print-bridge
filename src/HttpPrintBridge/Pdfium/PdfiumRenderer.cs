@@ -4,10 +4,12 @@ namespace HttpPrintBridge.Pdfium;
 
 /// <summary>
 /// A single page rendered to a top-down 32-bit BGRA buffer, ready for StretchDIBits.
+/// The buffer is PDFium's own bitmap memory; this wrapper owns the bitmap and frees
+/// it on dispose (no managed copy of the pixels is made).
 /// </summary>
 public sealed class RenderedPage : IDisposable
 {
-    private GCHandle _pin;
+    private nint _bmp;
     private bool _disposed;
 
     public int Width { get; }
@@ -22,7 +24,7 @@ public sealed class RenderedPage : IDisposable
     public int PageNumber { get; }
 
     internal RenderedPage(int pageNumber, double widthPoints, double heightPoints,
-        int width, int height, int stride, byte[] buffer)
+        int width, int height, int stride, nint bmp, nint scan0)
     {
         PageNumber = pageNumber;
         WidthPoints = widthPoints;
@@ -30,15 +32,19 @@ public sealed class RenderedPage : IDisposable
         Width = width;
         Height = height;
         Stride = stride;
-        _pin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
-        Scan0 = _pin.AddrOfPinnedObject();
+        _bmp = bmp;
+        Scan0 = scan0;
     }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        if (_pin.IsAllocated) _pin.Free();
+        if (_bmp != 0)
+        {
+            PdfiumNative.FPDFBitmap_Destroy(_bmp);
+            _bmp = 0;
+        }
     }
 }
 
@@ -98,9 +104,12 @@ public sealed class PdfDocument : IDisposable
 
     /// <summary>
     /// Renders one page to a BGRA buffer at the requested DPI. The returned
-    /// <see cref="RenderedPage"/> owns the pinned buffer; dispose it after printing.
+    /// <see cref="RenderedPage"/> owns PDFium's bitmap; dispose it after printing.
+    /// When a non-zero <paramref name="maxWidthPx"/>×<paramref name="maxHeightPx"/>
+    /// box is given, the raster is clamped to fit inside it (aspect preserved) so
+    /// pixels that GDI would only scale back down are never rendered.
     /// </summary>
-    public RenderedPage RenderPage(int pageIndex, int dpi)
+    public RenderedPage RenderPage(int pageIndex, int dpi, int maxWidthPx = 0, int maxHeightPx = 0)
     {
         if (dpi is < 36 or > 1200)
             throw new ArgumentOutOfRangeException(nameof(dpi), "DPI must be between 36 and 1200.");
@@ -114,6 +123,19 @@ public sealed class PdfDocument : IDisposable
             int wPx = Math.Max(1, (int)Math.Round(wPt / 72.0 * dpi));
             int hPx = Math.Max(1, (int)Math.Round(hPt / 72.0 * dpi));
 
+            // Clamp to the size that will actually be printed. Rendering more pixels
+            // than StretchDIBits would scale away again is pure cost; a dpi below the
+            // device size is still honoured (that is the caller's speed/quality knob).
+            if (maxWidthPx > 0 && maxHeightPx > 0)
+            {
+                double fit = Math.Min((double)maxWidthPx / wPx, (double)maxHeightPx / hPx);
+                if (fit < 1.0)
+                {
+                    wPx = Math.Max(1, (int)Math.Round(wPx * fit));
+                    hPx = Math.Max(1, (int)Math.Round(hPx * fit));
+                }
+            }
+
             // Guard against absurd page sizes blowing past the 32-bit stride limit.
             long strideLong = (long)wPx * 4;
             long totalLong = strideLong * hPx;
@@ -124,6 +146,7 @@ public sealed class PdfDocument : IDisposable
             if (bmp == 0)
                 throw new PdfiumException("Failed to allocate render bitmap.", PdfiumNative.FpdfErrUnknown);
 
+            bool handedOff = false;
             try
             {
                 // Opaque white background so transparent PDF regions don't print black.
@@ -138,14 +161,16 @@ public sealed class PdfDocument : IDisposable
                 if (buffer == 0 || stride <= 0)
                     throw new PdfiumException("Render bitmap has no accessible buffer.", PdfiumNative.FpdfErrUnknown);
 
-                byte[] managed = new byte[(long)stride * hPx];
-                Marshal.Copy(buffer, managed, 0, managed.Length);
-
-                return new RenderedPage(pageIndex + 1, wPt, hPt, wPx, hPx, stride, managed);
+                // Zero-copy: print directly from PDFium's buffer. RenderedPage takes
+                // ownership of the bitmap and destroys it on Dispose.
+                var rendered = new RenderedPage(pageIndex + 1, wPt, hPt, wPx, hPx, stride, bmp, buffer);
+                handedOff = true;
+                return rendered;
             }
             finally
             {
-                PdfiumNative.FPDFBitmap_Destroy(bmp);
+                if (!handedOff)
+                    PdfiumNative.FPDFBitmap_Destroy(bmp);
             }
         }
         finally

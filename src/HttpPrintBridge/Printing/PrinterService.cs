@@ -107,7 +107,8 @@ public sealed class PrinterService
 
     /// <summary>
     /// Renders and prints every page of <paramref name="doc"/> silently.
-    /// Pages are rendered one at a time so peak memory stays at a single page.
+    /// Pages are rendered one at a time so peak memory stays at a single page,
+    /// except for the multi-copy fallback which may cache the whole book (capped).
     /// <paramref name="outputPath"/> redirects the spooler output to a file, which is how
     /// virtual printers such as "Microsoft Print to PDF" stay silent instead of prompting.
     /// </summary>
@@ -196,24 +197,45 @@ public sealed class PrinterService
 
                 try
                 {
-                    // HALFTONE gives much better downscales than COLORONCOLOR.
-                    WinspoolNative.SetStretchBltMode(hdc, WinspoolNative.HALFTONE);
+                    // Brush origin must be pinned before the first HALFTONE blit.
                     WinspoolNative.SetBrushOrgEx(hdc, 0, 0, 0);
 
                     int printableWidth = Math.Max(1, WinspoolNative.GetDeviceCaps(hdc, WinspoolNative.HORZRES));
                     int printableHeight = Math.Max(1, WinspoolNative.GetDeviceCaps(hdc, WinspoolNative.VERTRES));
 
                     // With a DEVMODE the driver handles dmCopies; without one we print the
-                    // page loop once per copy ourselves.
+                    // page loop once per copy ourselves. Rendering is then shared across
+                    // copies when the whole book fits the cache budget.
                     int copyCount = devmodePtr == 0 ? copies : 1;
-                    for (int copy = 0; copy < copyCount; copy++)
+                    List<RenderedPage>? cache = copyCount > 1
+                        ? TryRenderAllPages(doc, dpi, printableWidth, printableHeight, ct)
+                        : null;
+                    try
                     {
-                        for (int pageIndex = 0; pageIndex < doc.PageCount; pageIndex++)
+                        for (int copy = 0; copy < copyCount; copy++)
                         {
-                            ct.ThrowIfCancellationRequested();
+                            for (int pageIndex = 0; pageIndex < doc.PageCount; pageIndex++)
+                            {
+                                ct.ThrowIfCancellationRequested();
 
-                            using RenderedPage page = doc.RenderPage(pageIndex, dpi);
-                            PrintOnePage(hdc, page, printableWidth, printableHeight);
+                                if (cache is not null)
+                                {
+                                    PrintOnePage(hdc, cache[pageIndex], printableWidth, printableHeight);
+                                }
+                                else
+                                {
+                                    using RenderedPage page = doc.RenderPage(pageIndex, dpi, printableWidth, printableHeight);
+                                    PrintOnePage(hdc, page, printableWidth, printableHeight);
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        if (cache is not null)
+                        {
+                            foreach (RenderedPage page in cache)
+                                page.Dispose();
                         }
                     }
                 }
@@ -240,6 +262,40 @@ public sealed class PrinterService
         }
     }
 
+    /// <summary>
+    /// Renders every page up front when the whole book fits the cache budget, so a
+    /// per-copy loop can resubmit the rasters instead of rendering the book again for
+    /// every copy. Returns null when the book is too big — the caller then re-renders
+    /// per copy to keep peak memory at a single page.
+    /// </summary>
+    private static List<RenderedPage>? TryRenderAllPages(PdfDocument doc, int dpi,
+        int printableWidth, int printableHeight, CancellationToken ct)
+    {
+        const long maxCacheBytes = 256L * 1024 * 1024;
+
+        // Upper bound of one clamped page: the raster never exceeds the printable area.
+        long totalBytes = 4L * printableWidth * printableHeight * doc.PageCount;
+        if (totalBytes > maxCacheBytes)
+            return null;
+
+        var pages = new List<RenderedPage>(doc.PageCount);
+        try
+        {
+            for (int i = 0; i < doc.PageCount; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                pages.Add(doc.RenderPage(i, dpi, printableWidth, printableHeight));
+            }
+            return pages;
+        }
+        catch
+        {
+            foreach (RenderedPage page in pages)
+                page.Dispose();
+            throw;
+        }
+    }
+
     private static void PrintOnePage(nint hdc, RenderedPage page, int printableWidth, int printableHeight)
     {
         if (WinspoolNative.StartPage(hdc) <= 0)
@@ -257,6 +313,15 @@ public sealed class PrinterService
             int destH = Math.Max(1, (int)Math.Round(page.Height * scale));
             int destX = (printableWidth - destW) / 2;
             int destY = (printableHeight - destH) / 2;
+
+            // HALFTONE gives much better downscales than COLORONCOLOR but is far
+            // slower. When the raster already matches the sheet — the common case,
+            // because RenderPage clamps to the printable area — a straight blit is
+            // identical in output and much cheaper.
+            int stretchMode = scale is > 0.98 and < 1.02
+                ? WinspoolNative.COLORONCOLOR
+                : WinspoolNative.HALFTONE;
+            WinspoolNative.SetStretchBltMode(hdc, stretchMode);
 
             unsafe
             {
@@ -298,16 +363,44 @@ public sealed class PrinterService
     {
         if (!string.IsNullOrWhiteSpace(requested))
         {
-            foreach (PrinterInfo p in ListPrinters())
+            // Validate with OpenPrinter instead of enumerating every printer — a full
+            // EnumPrinters walk costs hundreds of milliseconds when network printers are
+            // present, and print only needs the one name. GetPrinter then reports the
+            // canonical name so the response matches what /{key}/list shows.
+            if (!WinspoolNative.OpenPrinter(requested, out nint hPrinter, 0))
+                throw new PrinterNotFoundException(requested);
+            try
             {
-                if (string.Equals(p.Name, requested, StringComparison.OrdinalIgnoreCase))
-                    return p.Name;
+                return GetPrinterName(hPrinter) ?? requested;
             }
-            throw new PrinterNotFoundException(requested);
+            finally
+            {
+                WinspoolNative.ClosePrinter(hPrinter);
+            }
         }
 
         return TryGetDefaultPrinter()
                ?? throw new PrinterNotFoundException("(default — no default printer configured)");
+    }
+
+    private static string? GetPrinterName(nint hPrinter)
+    {
+        WinspoolNative.GetPrinter(hPrinter, 2, 0, 0, out uint needed);
+        if (needed == 0)
+            return null;
+
+        nint buffer = Marshal.AllocHGlobal((int)needed);
+        try
+        {
+            if (!WinspoolNative.GetPrinter(hPrinter, 2, buffer, needed, out _))
+                return null;
+            var info = Marshal.PtrToStructure<WinspoolNative.PRINTER_INFO_2>(buffer);
+            return PtrToString(info.pPrinterName);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 
     private static string? PtrToString(nint ptr) =>
